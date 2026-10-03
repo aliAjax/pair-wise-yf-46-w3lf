@@ -1,17 +1,41 @@
 # pair-wise-yf-46 国际新闻直播编排与突发插播控制台
 
-源提示词摘要：面向导播、主编、字幕和演播室岗位的直播串联单，维护新闻片、连线、嘉宾、口播和广告；支持时长重算、硬时间风险、突发插播、角色权限、操作历史、一键撤回和断网应急队列。
+串联单、突发插播、应急队列、硬时间风险落在**同一份带版本号的可恢复编排账**上，取代"按最后一次保存覆盖"。
 
-## 技术栈
+## 编排账模型（`src/domain/ledger/`）
 
-React19、TypeScript、Vite、Ant Design、Redux Toolkit、RTK Query、React Router、React Hook Form、Zod、i18next、date-fns、dnd-kit。
+- `Ledger`：`docVersion` 账本版本 + 段落 `version` 段级版本 + `opLog/audit` 操作审计流 + `conflicts` 冲突清单 + `changes` 突发记录 + `appliedOpIds/conflictOpIds` 幂等集合。
+- `Op`：每条操作带全局唯一 `opId`、岗位自增 `seq`、岗位 `station`、读取时的 `baseVersion`。
+- `engine.ts` 为纯函数（无 React/DOM 依赖），`server.ts` 用 localStorage 模拟服务端持久化与写入故障。
 
-## 本地运行
+### 需求落点
+
+1. **同段并发不覆盖**：提交操作携带读到的 `baseVersion`，与当前段落版本不一致时，后到操作不应用、差异列入 `conflicts`（字段级对比：已确认值 vs 后到值），先确认版本原样保留；仅导播可在「并发冲突」页裁决"保留先确认 / 采用后到"。
+2. **插播/时长变更即失效重算**：突发插播或时长修改后，插入点/改动点下游所有未开播段落立即标记 `stale`（附原因），时间轴重算并对硬时间段落给出晚点分钟数；导播"确认重算"后逐段升版、清除失效。已播出段落锁定（不可改/取消），播出瞬间整段快照写入审计留档。
+3. **断网排队、回连按序号合并**：断网操作先占岗位序号入应急队列并在本地账本预演（本地仍可播）；回连后 `flushQueue` 严格按 `{岗位, seq}` 逐条提交。服务端按 `opId` 幂等——同一插播只入库一次；模拟写入故障时操作不落库，恢复后只重试仍是 pending 的部分。
+4. **旧数据补版本**：旧的无版本号数组（含上一版 localStorage 键）首次打开由 `bootstrap/migrateItem` 补 `version=1` 并回写新键。
+5. **岗位分权**：授权在引擎层（`domain/permissions.ts`）强制执行，UI 只做显隐：
+   - 导播：时长、顺序、播出/取消、突发插播、确认重算、冲突裁决；
+   - 主编：标题/类型/时长/硬时间、新增条目、突发插播；
+   - 字幕：仅字幕条 `lowerThird`；
+   - 演播室：仅主播、来源。
+   越权操作（包括越字段）返回 `denied`，在线/离线都不会落账。
+
+## 验证
 
 ```bash
 npm install
-npm run dev
+npm run test:ledger   # 17 条引擎自测：迁移/乐观锁冲突/差异/裁决/失效重算/硬时间/权限/幂等/故障重试
 npm run build
+npm run dev           # 端口 62011
 ```
 
-开发端口：62011
+手动演示路径：
+
+- 开两个浏览器标签（共享 localStorage，2 秒轮询拉取）模拟两个岗位；标签 A 主编先改某段标题保存，标签 B 字幕用旧行「编辑」改字幕条提交 → B 收到冲突提示，「并发冲突」页出现字段差异，由导播裁决。
+- 顶栏切「断网」→ 做插播/改时长/取消（操作入应急队列、本地即时生效）→ 在应急队列页点「模拟下一次写入失败」后回连合并：已写入的 ack，未写入的留在队列，再次合并只重试这部分。
+- 突发插播后下游段落变橙「待重算确认」，汇总条显示硬时间风险数；「确认重算」后清除。
+
+## 技术栈
+
+React 19、TypeScript、Vite、Ant Design、Redux Toolkit、React Hook Form、Zod、i18next、dnd-kit；领域层为纯函数 + `node:test` 自测。
